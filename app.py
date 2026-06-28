@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,7 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "戦略版 v3（明確トレンド・初回〜2回目・勢いブレイク）"
+APP_VERSION = "戦略版 v4（構造的損切り）"
 TICKER_INTRADAY = "NIY=F"
 TICKER_DAILY = "^N225"
 JST = "Asia/Tokyo"
@@ -26,7 +25,7 @@ JST = "Asia/Tokyo"
 TICK = 5
 YEN_PER_POINT_PER_MICRO = 10
 RISK_PER_TRADE_PCT = 0.01
-MAX_STOP_WIDTH = 100
+# 損切り幅は固定しない。根拠足・押し安値／戻り高値の少し外に置く。
 STOP_BUFFER = 5
 TARGET_R1 = 1.5
 TARGET_R2 = 2.0
@@ -508,23 +507,71 @@ def confirmation_holds_ema(confirm_bar: pd.Series, direction: str, breakout_leve
     return True, None
 
 
-def calculate_plan(direction: str, entry: float, stop: float, setup: str, reasons: list[str]) -> dict:
+def build_structural_stop(
+    direction: str,
+    rationale_bar: pd.Series,
+    structure_window: pd.DataFrame,
+    rationale_label: str,
+    structure_label: str,
+) -> tuple[float, dict]:
+    """固定幅ではなく、反発シナリオが否定される構造の外側に損切りを置く。
+
+    BUY は「根拠になった5分足安値」と「直近押し安値」の低い方を基準に、
+    SELL は「根拠になった5分足高値」と「直近戻り高値」の高い方を基準にする。
+    その基準から最低5円外へ置くため、根拠が崩れた時だけ損切りになる。
+    """
+    if structure_window.empty:
+        structure_window = pd.DataFrame([rationale_bar])
+
+    if direction == "BUY":
+        candidates = [
+            (rationale_label, float(rationale_bar["Low"])),
+            (structure_label, float(structure_window["Low"].min())),
+        ]
+        basis_label, basis_price = min(candidates, key=lambda x: x[1])
+        raw_stop = basis_price - STOP_BUFFER
+        stop_reason = (
+            f"{basis_label} {basis_price:,.0f}円の少し下（最低{STOP_BUFFER}円外）。"
+            "ここを割れると押し目反発シナリオが否定される。"
+        )
+    else:
+        candidates = [
+            (rationale_label, float(rationale_bar["High"])),
+            (structure_label, float(structure_window["High"].max())),
+        ]
+        basis_label, basis_price = max(candidates, key=lambda x: x[1])
+        raw_stop = basis_price + STOP_BUFFER
+        stop_reason = (
+            f"{basis_label} {basis_price:,.0f}円の少し上（最低{STOP_BUFFER}円外）。"
+            "ここを超えると戻り売りシナリオが否定される。"
+        )
+
+    return raw_stop, {
+        "stop_basis_label": basis_label,
+        "stop_basis_price": basis_price,
+        "stop_reason": stop_reason,
+        "stop_candidates": candidates,
+    }
+
+
+def calculate_plan(
+    direction: str,
+    entry: float,
+    stop: float,
+    setup: str,
+    reasons: list[str],
+    stop_meta: dict | None = None,
+) -> dict:
     entry = ceil_tick(entry) if direction == "BUY" else floor_tick(entry)
     stop = floor_tick(stop) if direction == "BUY" else ceil_tick(stop)
     risk = (entry - stop) if direction == "BUY" else (stop - entry)
 
     if risk <= 0:
         return {"valid": False, "reason": "損切り位置が不正です。"}
-    if risk > MAX_STOP_WIDTH:
-        return {
-            "valid": False,
-            "reason": f"必要な損切り幅が{risk:.0f}円で、上限{MAX_STOP_WIDTH}円を超えています。",
-            "risk": risk,
-        }
 
     target1 = ceil_tick(entry + risk * TARGET_R1) if direction == "BUY" else floor_tick(entry - risk * TARGET_R1)
     target2 = ceil_tick(entry + risk * TARGET_R2) if direction == "BUY" else floor_tick(entry - risk * TARGET_R2)
-    return {
+    plan = {
         "valid": True,
         "direction": direction,
         "entry": int(entry),
@@ -535,6 +582,9 @@ def calculate_plan(direction: str, entry: float, stop: float, setup: str, reason
         "setup": setup,
         "reasons": reasons,
     }
+    if stop_meta:
+        plan.update(stop_meta)
+    return plan
 
 
 # ------------------------
@@ -606,12 +656,20 @@ def pullback_setup_at(
             reasons.append("5分足MACDも上向き")
 
         if not apply_momentum_filter:
+            structural_stop, stop_meta = build_structural_stop(
+                "BUY",
+                reversal,
+                stop_window,
+                "エントリー根拠の反転陽線安値",
+                "直近押し安値",
+            )
             plan = calculate_plan(
                 "BUY",
                 reversal["High"] + TICK,
-                stop_window["Low"].min() - STOP_BUFFER,
+                structural_stop,
                 "15分足上昇＋5分足25EMA押し目",
                 reasons,
+                stop_meta,
             )
             if plan.get("valid"):
                 plan.update({"bar_time": reversal.name, "touch_event_no": touch_no})
@@ -632,12 +690,20 @@ def pullback_setup_at(
             "直近高値ブレイク足に十分な実体・値幅がある",
             "ブレイク直後の足が5分足25EMAへ戻っていない",
         ])
+        structural_stop, stop_meta = build_structural_stop(
+            "BUY",
+            reversal,
+            stop_window,
+            "エントリー根拠の反転陽線安値",
+            "直近押し安値",
+        )
         plan = calculate_plan(
             "BUY",
             max(float(breakout["High"]), float(confirm["High"])) + TICK,
-            stop_window["Low"].min() - STOP_BUFFER,
+            structural_stop,
             "明確上昇＋25EMA初回〜2回目押し目＋勢いブレイク",
             reasons,
+            stop_meta,
         )
         if plan.get("valid"):
             plan.update({"bar_time": confirm.name, "touch_event_no": touch_no})
@@ -662,12 +728,20 @@ def pullback_setup_at(
         reasons.append("5分足MACDも下向き")
 
     if not apply_momentum_filter:
+        structural_stop, stop_meta = build_structural_stop(
+            "SELL",
+            reversal,
+            stop_window,
+            "エントリー根拠の反転陰線高値",
+            "直近戻り高値",
+        )
         plan = calculate_plan(
             "SELL",
             reversal["Low"] - TICK,
-            stop_window["High"].max() + STOP_BUFFER,
+            structural_stop,
             "15分足下降＋5分足25EMA戻り売り",
             reasons,
+            stop_meta,
         )
         if plan.get("valid"):
             plan.update({"bar_time": reversal.name, "touch_event_no": touch_no})
@@ -688,12 +762,20 @@ def pullback_setup_at(
         "直近安値ブレイク足に十分な実体・値幅がある",
         "ブレイク直後の足が5分足25EMAへ戻っていない",
     ])
+    structural_stop, stop_meta = build_structural_stop(
+        "SELL",
+        reversal,
+        stop_window,
+        "エントリー根拠の反転陰線高値",
+        "直近戻り高値",
+    )
     plan = calculate_plan(
         "SELL",
         min(float(breakout["Low"]), float(confirm["Low"])) - TICK,
-        stop_window["High"].max() + STOP_BUFFER,
+        structural_stop,
         "明確下降＋25EMA初回〜2回目戻り＋勢いブレイク",
         reasons,
+        stop_meta,
     )
     if plan.get("valid"):
         plan.update({"bar_time": confirm.name, "touch_event_no": touch_no})
@@ -765,10 +847,17 @@ def detect_opening_breakout_setup(df: pd.DataFrame) -> dict:
         holds, reason = confirmation_holds_ema(confirm, "BUY", range_high)
         if not holds:
             return {"valid": False, "status": "見送り", "detail": reason, "range_high": range_high, "range_low": range_low}
+        structural_stop, stop_meta = build_structural_stop(
+            "BUY",
+            breakout,
+            recent_stop,
+            "エントリー根拠の上抜けブレイク足安値",
+            "直近押し安値",
+        )
         plan = calculate_plan(
             "BUY",
             max(float(breakout["High"]), float(confirm["High"])) + TICK,
-            recent_stop["Low"].min() - STOP_BUFFER,
+            structural_stop,
             f"{row['SESSION_KIND']}寄り後30分レンジ・勢い上抜け",
             [
                 f"寄り後30分高値 {range_high:,}円を強い陽線で上抜け",
@@ -776,6 +865,7 @@ def detect_opening_breakout_setup(df: pd.DataFrame) -> dict:
                 "確認足が5分足25EMAへ戻っていない",
                 "15分足25EMAが明確に上向き",
             ],
+            stop_meta,
         )
     else:
         if float(breakout["Low"]) > range_low - TICK:
@@ -786,10 +876,17 @@ def detect_opening_breakout_setup(df: pd.DataFrame) -> dict:
         holds, reason = confirmation_holds_ema(confirm, "SELL", range_low)
         if not holds:
             return {"valid": False, "status": "見送り", "detail": reason, "range_high": range_high, "range_low": range_low}
+        structural_stop, stop_meta = build_structural_stop(
+            "SELL",
+            breakout,
+            recent_stop,
+            "エントリー根拠の下抜けブレイク足高値",
+            "直近戻り高値",
+        )
         plan = calculate_plan(
             "SELL",
             min(float(breakout["Low"]), float(confirm["Low"])) - TICK,
-            recent_stop["High"].max() + STOP_BUFFER,
+            structural_stop,
             f"{row['SESSION_KIND']}寄り後30分レンジ・勢い下抜け",
             [
                 f"寄り後30分安値 {range_low:,}円を強い陰線で下抜け",
@@ -797,6 +894,7 @@ def detect_opening_breakout_setup(df: pd.DataFrame) -> dict:
                 "確認足が5分足25EMAへ戻っていない",
                 "15分足25EMAが明確に下向き",
             ],
+            stop_meta,
         )
 
     plan["status"] = "買い待機" if plan.get("valid") and plan.get("direction") == "BUY" else "売り待機"
@@ -930,6 +1028,7 @@ def backtest_pullback(
                     "損切り幅": plan["risk"],
                     "発動価格": plan["entry"],
                     "25EMA反発回数": plan.get("touch_event_no", np.nan),
+                    "損切り根拠": plan.get("stop_basis_label", ""),
                 }
             )
             i = max(i + BACKTEST_COOLDOWN_BARS, (exit_i or i) + 1)
@@ -970,7 +1069,7 @@ def summarize_backtest(trades: pd.DataFrame) -> dict | None:
 # ------------------------
 st.title(f"日経225先物｜順張り手法 {APP_VERSION}")
 st.caption(
-    "明確な15分足25EMAの方向だけに絞り、5分足25EMAの初回〜2回目反発と、勢いのある直近高安ブレイクだけを狙う判定アプリ"
+    "明確な15分足25EMAの方向だけに絞り、初回〜2回目の5分足25EMA反発・勢いブレイク・構造的損切りを使う判定アプリ"
 )
 
 with st.sidebar:
@@ -1101,6 +1200,8 @@ with tab2:
             color(f"{pullback['status']}：{pullback['setup']}")
             for reason in pullback.get("reasons", []):
                 st.write(f"・{reason}")
+            if pullback.get("stop_reason"):
+                st.write(f"・損切り根拠：{pullback['stop_reason']}")
         else:
             st.warning(f"{pullback.get('status', '見送り')}：{pullback.get('detail', pullback.get('reason', '条件未達'))}")
 
@@ -1111,6 +1212,8 @@ with tab2:
             color(f"{breakout['status']}：{breakout['setup']}")
             for reason in breakout.get("reasons", []):
                 st.write(f"・{reason}")
+            if breakout.get("stop_reason"):
+                st.write(f"・損切り根拠：{breakout['stop_reason']}")
         else:
             st.warning(f"{breakout.get('status', '見送り')}：{breakout.get('detail', breakout.get('reason', '条件未達'))}")
             if "range_high" in breakout:
@@ -1150,8 +1253,18 @@ with tab3:
         r2.metric("1枚あたり最大損失", f"{position['risk_per_contract']:,}円")
         r3.metric("最大枚数", f"{position['contracts']}枚")
 
+        if main_plan.get("stop_reason"):
+            st.info("損切り根拠：" + main_plan["stop_reason"])
+            st.caption(
+                "固定の損切り幅は使っていません。根拠になった5分足と直近の押し安値／戻り高値を比較し、"
+                "シナリオが否定される側の少し外へ自動配置しています。"
+            )
+
         if position["contracts"] < 1:
-            st.error("資金1%ルールでは1枚も許容できません。損切りが狭い次のセットアップを待ちます。")
+            st.error(
+                "この構造的損切り幅では、資金1%ルールで1枚を許容できません。"
+                "損切りを無理に狭めず、次のセットアップか資金量に合うロットを待ちます。"
+            )
         else:
             st.caption(
                 f"資金 {int(capital):,}円 × 1% ＝ 許容損失 {position['allowed_loss']:,}円。"
@@ -1260,7 +1373,8 @@ with tab5:
         "5分足25EMAからの反発は、現セッションで初回〜2回目だけを採用する。3回目以降は見送る。",
         "買いは明確上昇＋押し目、売りは明確下降＋戻り売りだけを狙う。",
         "ブレイク足が小さい、実体が小さい、逆方向ヒゲが長い、またはブレイク直後にMAへ戻るなら見送る。",
-        "損切りが100円を超える形は、期待値があっても見送る。",
+        "損切りは固定幅にせず、根拠になった5分足の高安値または直近押し安値／戻り高値の少し外に置く。",
+        "構造的な損切り幅に対して資金1%で1枚も持てない時は、損切りを無理に狭めず見送る。",
         "1回の許容損失は資金の1%。連敗しても枚数を増やさない。",
         "アプリは候補を出すだけ。発注はマネックスの実際の価格・チャートで最終確認する。",
     ]
