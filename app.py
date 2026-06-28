@@ -16,7 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "戦略版 v1"
+APP_VERSION = "戦略版 v2（レンジ除外）"
 TICKER_INTRADAY = "NIY=F"
 TICKER_DAILY = "^N225"
 JST = "Asia/Tokyo"
@@ -38,6 +38,16 @@ PULLBACK_STOP_BARS = 5             # 損切りに使う直近の構造高安
 RANGE_REFERENCE_BARS = 108         # 約9時間の重要レンジ確認用
 BACKTEST_HOLD_BARS = 36            # 約3時間で決着しなければ手仕舞い評価
 BACKTEST_COOLDOWN_BARS = 6
+
+# レンジ・往復相場を避ける除外フィルター（固定）
+# 25MAは、現行手法と同じEMA25を使います。
+TREND15_SLOPE_LOOKBACK = 6        # 15分足6本＝約90分
+TREND15_MIN_SLOPE_ATR = 0.35      # 90分の25EMA変化が15分ATRの0.35倍未満なら横ばい
+TREND15_CROSS_LOOKBACK = 8        # 15分足8本＝約2時間
+TREND15_MAX_SIDE_FLIPS = 1        # 2回以上、終値がEMAを上下に跨げば除外
+FIVE_MA_TOUCH_LOOKBACK = 12       # 5分足12本＝約1時間
+FIVE_MA_MAX_TOUCHES = 3           # 4回以上触れていれば除外
+MA_TOUCH_TOLERANCE = TICK         # 25EMA±5円を「接触」とみなす
 
 
 # ------------------------
@@ -196,10 +206,65 @@ def build_15m_trend(df5: pd.DataFrame) -> pd.DataFrame:
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last"})
         .dropna()
     )
+
     bars15["EMA25_15"] = bars15["Close"].ewm(span=25, adjust=False).mean()
     bars15["EMA25_SLOPE"] = bars15["EMA25_15"] - bars15["EMA25_15"].shift(3)
     bars15["CLOSE_CHANGE_3"] = bars15["Close"] - bars15["Close"].shift(3)
 
+    # 15分足ATR：横ばい判定を相場ボラティリティに合わせるために使用
+    prev_close = bars15["Close"].shift(1)
+    tr15 = pd.concat(
+        [
+            bars15["High"] - bars15["Low"],
+            (bars15["High"] - prev_close).abs(),
+            (bars15["Low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    bars15["ATR14_15"] = tr15.rolling(14).mean()
+
+    # ① 15分足25EMAが横ばいか
+    bars15["EMA25_CHANGE_N"] = (
+        bars15["EMA25_15"] - bars15["EMA25_15"].shift(TREND15_SLOPE_LOOKBACK)
+    )
+    bars15["EMA25_FLAT_15"] = (
+        bars15["EMA25_CHANGE_N"].abs()
+        < bars15["ATR14_15"] * TREND15_MIN_SLOPE_ATR
+    )
+
+    # ① 15分足の終値が25EMAを何度も跨いでいないか
+    close_side_raw = pd.Series(
+        np.select(
+            [
+                bars15["Close"] > bars15["EMA25_15"] + MA_TOUCH_TOLERANCE,
+                bars15["Close"] < bars15["EMA25_15"] - MA_TOUCH_TOLERANCE,
+            ],
+            [1, -1],
+            default=0,
+        ),
+        index=bars15.index,
+    )
+    # EMAのすぐ近くで終えた足（0）は、直前の上下どちら側だったかを引き継ぐ。
+    # これにより「上→EMA付近→下」のような跨ぎも取りこぼさない。
+    bars15["CLOSE_SIDE_15"] = close_side_raw.replace(0, np.nan).ffill().fillna(0)
+    prev_side = bars15["CLOSE_SIDE_15"].shift(1)
+    bars15["SIDE_FLIP_15"] = (
+        (bars15["CLOSE_SIDE_15"] != prev_side)
+        & (bars15["CLOSE_SIDE_15"] != 0)
+        & (prev_side != 0)
+    ).astype(int)
+    bars15["SIDE_FLIP_COUNT_15"] = (
+        bars15["SIDE_FLIP_15"]
+        .rolling(TREND15_CROSS_LOOKBACK, min_periods=TREND15_CROSS_LOOKBACK)
+        .sum()
+    )
+
+    bars15["TREND15_EXCLUDED"] = (
+        bars15["EMA25_FLAT_15"]
+        | (bars15["SIDE_FLIP_COUNT_15"] > TREND15_MAX_SIDE_FLIPS)
+    )
+
+    # 方向そのものは残し、除外対象かどうかは別列で管理する。
     bars15["TREND15"] = np.select(
         [
             (bars15["Close"] > bars15["EMA25_15"])
@@ -244,16 +309,49 @@ def add_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["VWAP"] = np.nan
 
+    # ② 5分足が25EMAに何度も触れている状態を数える。
+    # 1〜3回の接触は通常の押し目／戻りとして許容し、4回以上はレンジ扱いで除外する。
+    out["TOUCH_5"] = (
+        (out["Low"] <= out["EMA25_5"] + MA_TOUCH_TOLERANCE)
+        & (out["High"] >= out["EMA25_5"] - MA_TOUCH_TOLERANCE)
+    )
+    out["TOUCH_COUNT_5"] = out.groupby("SESSION_ID")["TOUCH_5"].transform(
+        lambda values: values.astype(int).rolling(FIVE_MA_TOUCH_LOOKBACK, min_periods=1).sum()
+    )
+    out["FIVE_MIN_EXCLUDED"] = out["TOUCH_COUNT_5"] > FIVE_MA_MAX_TOUCHES
+
     bars15 = build_15m_trend(out)
     out = pd.merge_asof(
         out.sort_index(),
-        bars15[["EMA25_15", "EMA25_SLOPE", "TREND15"]].sort_index(),
+        bars15[
+            [
+                "EMA25_15",
+                "EMA25_SLOPE",
+                "ATR14_15",
+                "EMA25_CHANGE_N",
+                "EMA25_FLAT_15",
+                "SIDE_FLIP_COUNT_15",
+                "TREND15_EXCLUDED",
+                "TREND15",
+            ]
+        ].sort_index(),
         left_index=True,
         right_index=True,
         direction="backward",
     )
     out.index.name = "Datetime"
-    return out.dropna(subset=["EMA25_5", "MACD5_SIGNAL", "ATR14_5", "EMA25_15", "TREND15"]).copy()
+    return out.dropna(
+        subset=[
+            "EMA25_5",
+            "MACD5_SIGNAL",
+            "ATR14_5",
+            "EMA25_15",
+            "ATR14_15",
+            "SIDE_FLIP_COUNT_15",
+            "TOUCH_COUNT_5",
+            "TREND15",
+        ]
+    ).copy()
 
 
 # ------------------------
@@ -262,6 +360,36 @@ def add_intraday_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def get_last_completed_index(df: pd.DataFrame) -> int:
     # 未完成の可能性がある最後の足を避け、ひとつ前の5分足を使う
     return max(0, len(df) - 2)
+
+
+def get_exclusion_reasons(row: pd.Series) -> list[str]:
+    """順張りが機能しにくいレンジ・往復相場の理由を返す。"""
+    reasons = []
+
+    if bool(row.get("EMA25_FLAT_15", False)):
+        change = abs(float(row.get("EMA25_CHANGE_N", 0.0)))
+        atr = float(row.get("ATR14_15", 0.0))
+        reasons.append(
+            f"15分足25EMAが横ばい（90分の変化 {change:.0f}円、15分ATR {atr:.0f}円）"
+        )
+
+    side_flips = int(round(float(row.get("SIDE_FLIP_COUNT_15", 0.0))))
+    if side_flips > TREND15_MAX_SIDE_FLIPS:
+        reasons.append(
+            f"15分足終値が25EMAを直近約2時間で{side_flips}回跨いでいる"
+        )
+
+    touches_5 = int(round(float(row.get("TOUCH_COUNT_5", 0.0))))
+    if touches_5 > FIVE_MA_MAX_TOUCHES:
+        reasons.append(
+            f"5分足が25EMAに直近約1時間で{touches_5}回触れている"
+        )
+
+    return reasons
+
+
+def is_excluded_by_chop(row: pd.Series) -> bool:
+    return len(get_exclusion_reasons(row)) > 0
 
 
 def calculate_plan(direction: str, entry: float, stop: float, setup: str, reasons: list[str]) -> dict:
@@ -300,6 +428,14 @@ def detect_pullback_setup(df: pd.DataFrame) -> dict:
         return {"status": "判定不足", "detail": "5分足データが不足しています。"}
 
     row = df.iloc[i]
+    exclusion_reasons = get_exclusion_reasons(row)
+    if exclusion_reasons:
+        return {
+            "status": "見送り",
+            "detail": "除外条件：" + " / ".join(exclusion_reasons),
+            "bar_time": row.name,
+        }
+
     prev = df.iloc[i - 1]
     recent = df.iloc[i - PULLBACK_TOUCH_BARS + 1 : i + 1]
     stop_window = df.iloc[i - PULLBACK_STOP_BARS + 1 : i + 1]
@@ -372,6 +508,13 @@ def detect_pullback_setup(df: pd.DataFrame) -> dict:
 def detect_opening_breakout_setup(df: pd.DataFrame) -> dict:
     i = get_last_completed_index(df)
     row = df.iloc[i]
+    exclusion_reasons = get_exclusion_reasons(row)
+    if exclusion_reasons:
+        return {
+            "status": "見送り",
+            "detail": "除外条件：" + " / ".join(exclusion_reasons),
+        }
+
     session_id = row["SESSION_ID"]
     session = df[df["SESSION_ID"] == session_id].copy()
     session = session[session.index <= row.name]
@@ -474,10 +617,19 @@ def daily_reasons(row: pd.Series) -> list[str]:
 # ------------------------
 # 過去検証（簡易）
 # ------------------------
-def pullback_setup_at(df: pd.DataFrame, i: int) -> dict | None:
+def pullback_setup_at(
+    df: pd.DataFrame,
+    i: int,
+    apply_chop_filter: bool = True,
+) -> dict | None:
     if i < max(35, PULLBACK_STOP_BARS + 2):
         return None
     row = df.iloc[i]
+
+    # 実運用と同じレンジ除外フィルターを過去検証にも適用する。
+    if apply_chop_filter and is_excluded_by_chop(row):
+        return None
+
     prev = df.iloc[i - 1]
     recent = df.iloc[i - PULLBACK_TOUCH_BARS + 1 : i + 1]
     stop_window = df.iloc[i - PULLBACK_STOP_BARS + 1 : i + 1]
@@ -557,11 +709,14 @@ def run_trade_outcome(df: pd.DataFrame, start_i: int, plan: dict) -> tuple[float
     return float(np.clip(result_r, -1.0, TARGET_R1)), last_i
 
 
-def backtest_pullback(df: pd.DataFrame) -> pd.DataFrame:
+def backtest_pullback(
+    df: pd.DataFrame,
+    apply_chop_filter: bool = True,
+) -> pd.DataFrame:
     rows = []
     i = 40
     while i < len(df) - 2:
-        plan = pullback_setup_at(df, i)
+        plan = pullback_setup_at(df, i, apply_chop_filter=apply_chop_filter)
         if plan is None:
             i += 1
             continue
@@ -656,6 +811,7 @@ pullback = detect_pullback_setup(intraday)
 breakout = detect_opening_breakout_setup(intraday)
 main_plan = choose_main_plan(pullback, breakout, current_price)
 position = calc_position_size(float(capital), main_plan)
+current_exclusion_reasons = get_exclusion_reasons(current_row)
 
 last_bar_time = intraday.index[current_i]
 minutes_old = max(0, int((pd.Timestamp.now(tz=JST) - last_bar_time).total_seconds() // 60))
@@ -672,14 +828,20 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 
 with tab1:
     st.subheader("今はどちら側だけを狙うか")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("日足の週方向", latest_daily["WEEK_SIGNAL"])
     c2.metric("15分足", current_row["TREND15"])
     c3.metric("5分足終値", f"{current_price:,.0f}")
     c4.metric("5分足の最終時刻", last_bar_time.strftime("%m/%d %H:%M"))
+    c5.metric("レンジ除外", "除外" if current_exclusion_reasons else "通過")
 
     if minutes_old > 20:
         st.warning(f"5分足が約{minutes_old}分前で止まっています。休場・データ遅延時は新規判断をしません。")
+
+    if current_exclusion_reasons:
+        st.error("レンジ除外が発動：" + " / ".join(current_exclusion_reasons))
+    else:
+        st.success("レンジ除外フィルターは通過。セットアップ条件だけを待ちます。")
 
     if main_plan.get("valid"):
         if main_plan["direction"] == "BUY":
@@ -705,6 +867,16 @@ with tab1:
         else:
             st.write("・VWAP：参照データの出来高不足で未判定")
         st.write(f"・約9時間レンジ：{range_low_9h:,} 〜 {range_high_9h:,}")
+        st.write(
+            f"・15分足25EMAの90分変化：{abs(float(current_row['EMA25_CHANGE_N'])):.0f}円 "
+            f"（15分ATR {float(current_row['ATR14_15']):.0f}円）"
+        )
+        st.write(
+            f"・15分足25EMAの跨ぎ：{int(round(float(current_row['SIDE_FLIP_COUNT_15'])))}回 / 直近約2時間"
+        )
+        st.write(
+            f"・5分足25EMAの接触：{int(round(float(current_row['TOUCH_COUNT_5'])))}回 / 直近約1時間"
+        )
 
     st.subheader("直近の5分足チャート")
     chart = intraday[["Close", "EMA9_5", "EMA25_5"]].tail(180).copy()
@@ -714,6 +886,14 @@ with tab1:
 
 with tab2:
     st.subheader("手法ごとのセットアップ判定")
+
+    if current_exclusion_reasons:
+        st.error(
+            "先にレンジ除外が発動しているため、セットアップは採用しません。\n\n・"
+            + "\n・".join(current_exclusion_reasons)
+        )
+    else:
+        st.success("レンジ除外フィルターを通過しています。次にセットアップ条件を確認します。")
 
     left, right = st.columns(2)
     with left:
@@ -794,40 +974,75 @@ with tab4:
     st.subheader("15分足トレンド＋5分足25EMA押し目／戻り売り｜簡易検証")
     st.caption(
         "直近30日程度の無料5分足で、利確1.5Rと損切り1Rのどちらが先かを保守的に集計します。"
+        "15分足25EMAの横ばい・跨ぎ、5分足25EMAの多重接触は除外して検証します。"
     )
 
     if st.button("過去30日を検証する", use_container_width=True):
         try:
-            with st.spinner("過去30日分の5分足を取得し、簡易検証しています..."):
+            with st.spinner("過去30日分の5分足を取得し、除外なし／除外ありを比較しています..."):
                 history = add_intraday_indicators(load_intraday("30d"))
-                trades = backtest_pullback(history)
-                st.session_state["backtest_trades"] = trades
+                st.session_state["backtest_trades_all"] = backtest_pullback(
+                    history,
+                    apply_chop_filter=False,
+                )
+                st.session_state["backtest_trades_filtered"] = backtest_pullback(
+                    history,
+                    apply_chop_filter=True,
+                )
         except Exception as error:
             st.error(f"検証データの取得に失敗しました：{error}")
 
-    trades = st.session_state.get("backtest_trades")
-    if isinstance(trades, pd.DataFrame):
-        summary = summarize_backtest(trades)
-        if summary is None:
+    trades_all = st.session_state.get("backtest_trades_all")
+    trades_filtered = st.session_state.get("backtest_trades_filtered")
+    if isinstance(trades_all, pd.DataFrame) and isinstance(trades_filtered, pd.DataFrame):
+        summary_all = summarize_backtest(trades_all)
+        summary_filtered = summarize_backtest(trades_filtered)
+
+        if summary_all is None and summary_filtered is None:
             st.warning("条件に合うトレードが見つかりませんでした。期間が短いか、条件が厳しすぎる可能性があります。")
         else:
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("トレード数", f"{summary['trades']}回")
-            c2.metric("勝率", f"{summary['win_rate']:.1f}%")
-            c3.metric("平均R", f"{summary['avg_r']:+.2f}R")
-            c4.metric("最大連敗", f"{summary['max_losing_streak']}回")
-            c5.metric("最大DD", f"{summary['max_drawdown_r']:.2f}R")
+            st.subheader("レンジ除外の有無による比較")
 
-            shown = trades.copy()
-            shown["日時"] = shown["日時"].dt.strftime("%m/%d %H:%M")
-            shown["結果R"] = shown["結果R"].map(lambda x: f"{x:+.2f}R")
-            st.dataframe(shown.tail(100), use_container_width=True, hide_index=True)
+            comparison = []
+            for label, summary in [
+                ("除外なし", summary_all),
+                ("レンジ除外あり", summary_filtered),
+            ]:
+                if summary is not None:
+                    comparison.append(
+                        {
+                            "検証": label,
+                            "トレード数": f"{summary['trades']}回",
+                            "勝率": f"{summary['win_rate']:.1f}%",
+                            "平均R": f"{summary['avg_r']:+.2f}R",
+                            "最大連敗": f"{summary['max_losing_streak']}回",
+                            "最大DD": f"{summary['max_drawdown_r']:.2f}R",
+                        }
+                    )
+
+            st.dataframe(
+                pd.DataFrame(comparison),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if summary_filtered is not None:
+                st.caption(
+                    "『レンジ除外あり』の平均R・最大DD・最大連敗が改善しているかを重視します。"
+                    "勝率だけが上がって平均Rが下がるなら、フィルターは採用しません。"
+                )
+
+                st.subheader("レンジ除外あり｜採用されたトレード一覧")
+                shown = trades_filtered.copy()
+                shown["日時"] = shown["日時"].dt.strftime("%m/%d %H:%M")
+                shown["結果R"] = shown["結果R"].map(lambda x: f"{x:+.2f}R")
+                st.dataframe(shown.tail(100), use_container_width=True, hide_index=True)
 
             st.warning(
                 "この検証は無料データの簡易版です。手数料、スリッページ、日経225マイクロとの価格差、同一足内の約定順は厳密に反映していません。"
             )
     else:
-        st.info("上の『過去30日を検証する』を押すと、簡易検証結果を表示します。")
+        st.info("上の『過去30日を検証する』を押すと、除外なし／レンジ除外ありを比較表示します。")
 
 with tab5:
     st.subheader("このアプリで守るルール")
@@ -836,4 +1051,7 @@ with tab5:
     st.write("3. 寄り後ブレイクは最初の約2時間まで。遅い時間の追いかけはしない。")
     st.write("4. 損切りが100円を超える形は、期待値があっても見送る。")
     st.write("5. 1回の許容損失は資金の1%。連敗しても枚数を増やさない。")
-    st.write("6. アプリは候補を出すだけ。発注はマネックスの実際の価格・チャートで最終確認する。")
+    st.write("6. 15分足25EMAが約90分横ばいなら、方向が見えても除外する。")
+    st.write("7. 15分足終値が約2時間で25EMAを2回以上跨いだら、往復相場として除外する。")
+    st.write("8. 5分足が約1時間で25EMAに4回以上触れたら、押し目ではなくレンジとして除外する。")
+    st.write("9. アプリは候補を出すだけ。発注はマネックスの実際の価格・チャートで最終確認する。")
