@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,7 +16,7 @@ st.set_page_config(
     layout="wide",
 )
 
-APP_VERSION = "戦略版 v5（必須条件＋加点1つ以上）"
+APP_VERSION = "戦略版 v7（検証ボタン・最大60日）"
 TICKER_INTRADAY = "NIY=F"
 TICKER_DAILY = "^N225"
 JST = "Asia/Tokyo"
@@ -1160,37 +1159,118 @@ with tab3:
             st.error("資金1%では1枚も許容できません。エントリーを見送るか、損切り構造が近い別セットアップを待ちます。")
 
 with tab4:
-    st.subheader("過去5日分の簡易検証")
-    st.caption("無料5分足の範囲で、同一セッション内・第一利確1.5Rまたは構造的損切りを比較します。手数料・スリッページ・実際の約定順序は未反映です。")
+    st.subheader("過去検証")
+    st.caption(
+        "通常の現在判定とは別に、選んだ期間の5分足を取得してから検証します。"
+        "ボタンを押すまで検証は実行しません。"
+    )
 
-    with st.spinner("必須条件のみ / 必須＋加点1つ以上 を比較中..."):
-        trades_required = backtest_strategy(intraday, require_bonus=False)
-        trades_final = backtest_strategy(intraday, require_bonus=True)
+    period_labels = {
+        "1mo": "直近1か月（推奨）",
+        "60d": "直近60日（無料5分足で取得できる最大目安）",
+    }
+    selected_period = st.selectbox(
+        "検証する期間",
+        options=list(period_labels.keys()),
+        index=0,
+        format_func=lambda value: period_labels[value],
+        key="backtest_period",
+    )
 
-    compare = []
-    for name, trades in [("必須条件のみ", trades_required), ("必須＋加点1つ以上", trades_final)]:
-        summary = summarize_backtest(trades)
-        if summary is None:
-            compare.append({"条件": name, "件数": 0, "勝率": "-", "平均R": "-", "PF": "-", "最大連敗": "-", "最大DD(R)": "-"})
-        else:
-            compare.append({
-                "条件": name,
-                "件数": summary["trades"],
-                "勝率": f"{summary['win_rate']:.1f}%",
-                "平均R": f"{summary['avg_r']:+.2f}",
-                "PF": f"{summary['profit_factor']:.2f}" if pd.notna(summary["profit_factor"]) else "-",
-                "最大連敗": summary["max_losing_streak"],
-                "最大DD(R)": f"{summary['max_drawdown_r']:.2f}",
-            })
-    st.dataframe(pd.DataFrame(compare), hide_index=True, use_container_width=True)
+    st.info(
+        "「過去検証を実行」を押した時だけ、選択期間の5分足を追加取得します。"
+        "現在判定用のデータとは別に検証します。"
+    )
 
-    st.markdown("#### 最終ルールで抽出された直近トレード")
-    if trades_final.empty:
-        st.info("直近5日では最終条件の該当がありません。条件が厳しいため、これは正常です。")
+    if st.button("過去検証を実行", type="primary", use_container_width=True, key="run_backtest"):
+        try:
+            with st.spinner(f"{period_labels[selected_period]}の5分足を取得して検証中..."):
+                backtest_intraday = add_intraday_indicators(load_intraday(selected_period))
+                trades_required = backtest_strategy(backtest_intraday, require_bonus=False)
+                trades_final = backtest_strategy(backtest_intraday, require_bonus=True)
+
+            st.session_state["backtest_results"] = {
+                "period": selected_period,
+                "bars": len(backtest_intraday),
+                "start": backtest_intraday.index.min(),
+                "end": backtest_intraday.index.max(),
+                "trades_required": trades_required,
+                "trades_final": trades_final,
+            }
+        except Exception as error:
+            st.error(f"過去検証用データの取得または計算でエラーが出ました：{error}")
+
+    results = st.session_state.get("backtest_results")
+
+    if results is None:
+        st.warning("まだ検証していません。期間を選び、上の「過去検証を実行」を押してください。")
     else:
-        show = trades_final.copy()
-        show["日時"] = show["日時"].dt.strftime("%m/%d %H:%M")
-        st.dataframe(show.tail(50), hide_index=True, use_container_width=True)
+        executed_period = results["period"]
+        if executed_period != selected_period:
+            st.warning(
+                f"現在表示中なのは「{period_labels[executed_period]}」の結果です。"
+                f"「{period_labels[selected_period]}」で検証するには、もう一度ボタンを押してください。"
+            )
+
+        st.success(
+            f"検証完了：{period_labels[executed_period]} / "
+            f"{results['start'].strftime('%Y/%m/%d %H:%M')} 〜 "
+            f"{results['end'].strftime('%Y/%m/%d %H:%M')} / "
+            f"5分足 {results['bars']:,}本"
+        )
+
+        st.caption(
+            "同一セッション内で、第一利確1.5Rまたは構造的損切りに到達するまでを評価します。"
+            "手数料・スリッページ・実際の約定順序は未反映です。"
+        )
+
+        compare = []
+        for name, trades in [
+            ("必須条件のみ", results["trades_required"]),
+            ("必須＋加点1つ以上", results["trades_final"]),
+        ]:
+            summary = summarize_backtest(trades)
+            if summary is None:
+                compare.append({
+                    "条件": name,
+                    "件数": 0,
+                    "勝率": "-",
+                    "平均R": "-",
+                    "PF": "-",
+                    "最大連敗": "-",
+                    "最大DD(R)": "-",
+                })
+            else:
+                compare.append({
+                    "条件": name,
+                    "件数": summary["trades"],
+                    "勝率": f"{summary['win_rate']:.1f}%",
+                    "平均R": f"{summary['avg_r']:+.2f}",
+                    "PF": f"{summary['profit_factor']:.2f}" if pd.notna(summary["profit_factor"]) else "-",
+                    "最大連敗": summary["max_losing_streak"],
+                    "最大DD(R)": f"{summary['max_drawdown_r']:.2f}",
+                })
+        st.dataframe(pd.DataFrame(compare), hide_index=True, use_container_width=True)
+
+        st.markdown("#### 最終ルールで抽出されたトレード")
+        final_trades = results["trades_final"]
+        if final_trades.empty:
+            st.info("この期間では、必須条件＋加点1つ以上に該当するトレードはありませんでした。")
+        else:
+            show = final_trades.copy()
+            show["日時"] = show["日時"].dt.strftime("%m/%d %H:%M")
+            st.dataframe(show.tail(100), hide_index=True, use_container_width=True)
+
+        csv = final_trades.copy()
+        if not csv.empty:
+            csv["日時"] = csv["日時"].dt.strftime("%Y-%m-%d %H:%M")
+            st.download_button(
+                "最終ルールの取引一覧をCSVで保存",
+                data=csv.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"n225_backtest_{executed_period}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 with tab5:
     st.subheader("このアプリの固定ルール")
